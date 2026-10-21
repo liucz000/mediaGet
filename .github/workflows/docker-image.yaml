@@ -1,0 +1,78 @@
+name: Docker Image
+
+# 在 GitHub 托管 runner 上构建镜像并推送到 GHCR，避免在 2C2G 服务器上本地构建（next build 会 OOM）。
+# 产物：ghcr.io/<owner>/mediaget:latest（默认分支）+ :sha-<短 SHA>（每次构建唯一标签）
+# 服务器侧只需：docker pull ghcr.io/<owner>/mediaget:latest
+#
+# 构建上下文与本地 `docker build .` 完全一致（仓库根 Dockerfile，含 yt-dlp + ffmpeg）。
+# 默认只出 linux/amd64；需要 arm64（如 Oracle ARM 机器）时把 platforms 改成
+# linux/amd64,linux/arm64 —— 代价是 QEMU 模拟下 npm ci + next build 会慢数倍。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "package.json"
+      - "package-lock.json"
+      - "next.config.mjs"
+      - "src/**"
+      - "packages/**"
+      - "public/**"
+      - ".github/workflows/docker-image.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/mediaget
+
+jobs:
+  build:
+    name: build + push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Dockerfile 用 NEXT_BUILD_ID 稳定 Server Action 的 build id
+          build-args: |
+            BUILD_ID=${{ github.sha }}
+          # 层缓存走 GitHub Actions 缓存，重复构建只重跑变更层
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
