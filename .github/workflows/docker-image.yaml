@@ -1,46 +1,52 @@
-name: Docker Image
+name: Docker Image (upstream)
 
-# 在 GitHub 托管 runner 上构建镜像并推送到 GHCR，避免在 2C2G 服务器上本地构建（next build 会 OOM）。
-# 产物：ghcr.io/<owner>/mediaget:latest（默认分支）+ :sha-<短 SHA>（每次构建唯一标签）
-# 服务器侧只需：docker pull ghcr.io/<owner>/mediaget:latest
+# 直接构建上游 hotier/mediaGet 的代码并推送到 GHCR，不依赖「先同步 fork」。
+# 触发：每天定时 + 手动。上游无新提交时自动跳过（同名 sha 标签已存在）。
+# 产物：ghcr.io/<owner>/mediaget:latest + :sha-<上游短 SHA>
 #
-# 构建上下文与本地 `docker build .` 完全一致（仓库根 Dockerfile，含 yt-dlp + ffmpeg）。
-# 默认只出 linux/amd64；需要 arm64（如 Oracle ARM 机器）时把 platforms 改成
-# linux/amd64,linux/arm64 —— 代价是 QEMU 模拟下 npm ci + next build 会慢数倍。
+# 注意：本 workflow 只构建上游代码，本 fork 内的改动（如 deploy/ 脚本）不会进镜像。
+# 需要构建 fork 代码时，把 checkout 的 repository 改回 ${{ github.repository }} 即可。
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "Dockerfile"
-      - ".dockerignore"
-      - "package.json"
-      - "package-lock.json"
-      - "next.config.mjs"
-      - "src/**"
-      - "packages/**"
-      - "public/**"
-      - ".github/workflows/docker-image.yaml"
+  schedule:
+    # UTC 19:00 = 北京时间 03:00，每天一次
+    - cron: "0 19 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "强制重建（跳过「镜像已存在」检查）"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: docker-${{ github.ref }}
+  group: docker-upstream
   cancel-in-progress: true
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/mediaget
+  UPSTREAM: hotier/mediaGet
 
 jobs:
   build:
-    name: build + push
+    name: build upstream + push
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout upstream
         uses: actions/checkout@v4
+        with:
+          repository: hotier/mediaGet
+          ref: main
+          fetch-depth: 1
+
+      - name: Resolve upstream revision
+        id: rev
+        run: |
+          echo "sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "full=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -52,27 +58,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Check whether image already exists
+        id: exists
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if docker manifest inspect "$IMAGE:sha-${{ steps.rev.outputs.sha }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "上游 ${{ steps.rev.outputs.sha }} 的镜像已存在，跳过构建"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push
+        if: steps.exists.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Dockerfile 用 NEXT_BUILD_ID 稳定 Server Action 的 build id
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ steps.rev.outputs.sha }}
           build-args: |
-            BUILD_ID=${{ github.sha }}
-          # 层缓存走 GitHub Actions 缓存，重复构建只重跑变更层
+            BUILD_ID=${{ steps.rev.outputs.full }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/hotier/mediaGet
+            org.opencontainers.image.revision=${{ steps.rev.outputs.full }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像构建结果"
+            echo ""
+            echo "- 上游版本：\`${{ steps.rev.outputs.sha }}\`"
+            echo "- 是否跳过：${{ steps.exists.outputs.skip }}"
+            echo "- 标签：\`$IMAGE:latest\` / \`$IMAGE:sha-${{ steps.rev.outputs.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
