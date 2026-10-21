@@ -8,6 +8,11 @@ name: Docker Image (upstream)
 # 需要构建 fork 代码时，把 checkout 的 repository 改回 ${{ github.repository }} 即可。
 
 on:
+  # 本文件变更即构建一次（用于验证链路 / 改了构建参数后立即生效）
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/docker-image.yaml"
   schedule:
     # UTC 19:00 = 北京时间 03:00，每天一次
     - cron: "0 19 * * *"
